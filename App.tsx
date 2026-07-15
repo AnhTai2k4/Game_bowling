@@ -1,12 +1,20 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { StyleSheet, Text, View, TouchableOpacity, Alert } from 'react-native';
 import { Accelerometer, Gyroscope } from 'expo-sensors';
+import dgram from 'react-native-udp';
+import { Buffer } from 'buffer';
 
-// Thay đổi IP này thành IP của ESP12 trong mạng LAN WiFi
-const ESP12_IP = 'http://192.168.4.1'; 
+// Đảm bảo Buffer khả dụng toàn cục cho react-native-udp
+global.Buffer = global.Buffer || Buffer;
+
+// Cấu hình địa chỉ IP và Port UDP của ESP8266
+const UDP_HOST = '192.168.4.1';
+const UDP_PORT = 4210;
 
 export default function App() {
   const [isThrowing, setIsThrowing] = useState(false);
+  const [lastThrow, setLastThrow] = useState({ force: '0', angle: '0' });
+  const [statusMsg, setStatusMsg] = useState('Sẵn sàng');
   
   // Lưu trữ các giá trị đo được
   const maxForce = useRef(0);
@@ -23,6 +31,7 @@ export default function App() {
     if (isThrowing) {
       // Đặt lại giá trị khi bắt đầu ném
       maxForce.current = 0;
+      setStatusMsg('Đang vung tay...');
 
       // Đọc gia tốc kế để tính Lực
       accelSubscription = Accelerometer.addListener(({ x, y, z }) => {
@@ -37,6 +46,8 @@ export default function App() {
       gyroSubscription = Gyroscope.addListener(({ x, y, z }) => {
         currentAngle.current = { x, y, z };
       });
+    } else {
+      setStatusMsg('Sẵn sàng');
     }
 
     return () => {
@@ -55,32 +66,52 @@ export default function App() {
     // Xử lý dữ liệu thô thành thông số game
     // Trừ đi 1G trọng lực (hoặc tùy theo logic hiệu chuẩn của bạn)
     const finalForce = Math.max(0, maxForce.current - 1).toFixed(2); 
-    const finalAngle = currentAngle.current.z.toFixed(2); // Giả sử trục Z quyết định độ chệch trái/phải
+    // Với tư thế cầm máy cạnh viền hướng trước sau (mặt ngửa trái, cạnh dài trên dưới), trục X là trục thẳng đứng -> gyro.x là độ bẻ lái trái/phải!
+    const finalAngle = currentAngle.current.x.toFixed(2);
 
-    // Bạn in ra cả 3 trục x, y, z lúc thả tay
-console.log(`Góc X: ${currentAngle.current.x}, Góc Y: ${currentAngle.current.y}, Góc Z: ${currentAngle.current.z}`);
-
-    console.log(`Lực ném: ${finalForce}, Hướng: ${finalAngle}`);
-    sendDataToESP(finalForce, finalAngle);
+    // In log ra Terminal
+    console.log(`Góc X: ${currentAngle.current.x}, Góc Y: ${currentAngle.current.y}, Góc Z: ${currentAngle.current.z}`);
+    console.log(`[UDP] Lực ném: ${finalForce}, Hướng: ${finalAngle}`);
+    
+    // Cập nhật giao diện màn hình
+    setLastThrow({ force: finalForce, angle: finalAngle });
+    
+    // Gửi dữ liệu qua UDP tới ESP8266
+    sendDataViaUDP(finalForce, finalAngle);
   };
 
-  const sendDataToESP = async (force: string, angle: string) => {
+  const sendDataViaUDP = (force: string, angle: string) => {
     try {
-      const response = await fetch(`${ESP12_IP}/throw`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ force, angle }),
+      // Tạo UDP Socket (IPv4)
+      const socket = dgram.createSocket({ type: 'udp4' });
+      const message = JSON.stringify({ force: parseFloat(force), angle: - parseFloat(angle) });
+      const buffer = Buffer.from(message);
+
+      // BẮT BUỘC với react-native-udp: Phải bind socket vào cổng local bất kỳ (0) trước khi gửi
+      socket.bind(0, (bindError: any) => {
+        if (bindError) {
+          console.error('[UDP Bind Error]:', bindError);
+          setStatusMsg('Lỗi khởi tạo cổng UDP');
+          return;
+        }
+
+        // Gửi gói tin UDP tới 192.168.4.1:4210
+        socket.send(buffer, 0, buffer.length, UDP_PORT, UDP_HOST, (error) => {
+          if (error) {
+            console.error('[UDP Error]:', error);
+            setStatusMsg('Gửi UDP thất bại!');
+            Alert.alert("Lỗi UDP", `Không thể gửi dữ liệu tới ${UDP_HOST}:${UDP_PORT}`);
+          } else {
+            console.log(`[UDP Success] Đã gửi: ${message} -> ${UDP_HOST}:${UDP_PORT}`);
+            setStatusMsg('Đã gửi UDP thành công!');
+          }
+          // Đóng socket sau khi gửi
+          socket.close();
+        });
       });
-      if (response.ok) {
-        Alert.alert("Thành công", "Đã gửi tín hiệu ném bóng!");
-      } else {
-        Alert.alert("Lỗi", "Gửi dữ liệu thất bại");
-      }
     } catch (error) {
-      Alert.alert("Lỗi", "Không thể kết nối đến ESP12. Hãy kiểm tra WiFi.");
-      console.log(error);
+      console.error('[UDP Exception]:', error);
+      Alert.alert("Lỗi Socket", "Khởi tạo kết nối UDP thất bại.");
     }
   };
 
@@ -90,7 +121,10 @@ console.log(`Góc X: ${currentAngle.current.x}, Góc Y: ${currentAngle.current.y
       
       <View style={styles.statusBox}>
         <Text style={styles.statusText}>
-          Trạng thái: {isThrowing ? "Đang vung tay..." : "Sẵn sàng"}
+          Trạng thái: {statusMsg}
+        </Text>
+        <Text style={styles.resultText}>
+          Lần ném cuối - Lực: {lastThrow.force} | Hướng: {lastThrow.angle}
         </Text>
       </View>
 
@@ -105,9 +139,9 @@ console.log(`Góc X: ${currentAngle.current.x}, Góc Y: ${currentAngle.current.y
       </TouchableOpacity>
 
       <Text style={styles.instructions}>
-        1. Kết nối WiFi của điện thoại với mạng của ESP12.{'\n'}
+        1. Kết nối WiFi điện thoại với mạng của ESP8266 ({UDP_HOST}).{'\n'}
         2. Nhấn giữ nút, thực hiện động tác ném bowling.{'\n'}
-        3. Buông tay ra khỏi màn hình để thả bóng.
+        3. Buông tay ra khỏi màn hình để thả bóng qua UDP port {UDP_PORT}.
       </Text>
     </View>
   );
@@ -138,6 +172,12 @@ const styles = StyleSheet.create({
   statusText: {
     color: '#FFF',
     fontSize: 18,
+    marginBottom: 10,
+  },
+  resultText: {
+    color: '#00E5FF',
+    fontSize: 16,
+    fontWeight: 'bold',
   },
   button: {
     width: 250,
