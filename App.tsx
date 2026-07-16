@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { StyleSheet, Text, View, TouchableOpacity, Alert } from 'react-native';
+import { StyleSheet, Text, View, TouchableOpacity, Alert, Image } from 'react-native';
 import { Accelerometer, Gyroscope } from 'expo-sensors';
 import dgram from 'react-native-udp';
 import { Buffer } from 'buffer';
@@ -13,12 +13,89 @@ const UDP_PORT = 4210;
 
 export default function App() {
   const [isThrowing, setIsThrowing] = useState(false);
+  const [isPositioning, setIsPositioning] = useState(false);
   const [lastThrow, setLastThrow] = useState({ force: '0', angle: '0' });
   const [statusMsg, setStatusMsg] = useState('Sẵn sàng');
+  const [currentPage, setCurrentPage] = useState<number>(1);
   
   // Lưu trữ các giá trị đo được
   const maxForce = useRef(0);
   const currentAngle = useRef({ x: 0, y: 0, z: 0 });
+  const currentAccel = useRef({ x: 0, y: 0, z: 0 });
+  const positionInterval = useRef<any>(null);
+
+  // Lắng nghe gói tin từ ESP gửi về (ví dụ {"navigated":1} hay {"navigated":2})
+  useEffect(() => {
+    const serverSocket = dgram.createSocket({ type: 'udp4' });
+    serverSocket.bind(UDP_PORT, (err: any) => {
+      if (err) {
+        console.log('[UDP Server Error]:', err);
+      } else {
+        console.log(`[UDP Server] Đang lắng nghe từ ESP trên cổng ${UDP_PORT}...`);
+      }
+    });
+
+    serverSocket.on('message', (msg, rinfo) => {
+      try {
+        const str = msg.toString('utf8');
+        console.log(`[UDP Received] từ ${rinfo.address}:${rinfo.port} -> ${str}`);
+        const data = JSON.parse(str);
+        if (data.navigated === 1) {
+          setCurrentPage(1);
+          setStatusMsg('Sẵn sàng');
+        } else if (data.navigated === 2) {
+          setCurrentPage(2);
+          setStatusMsg('Sẵn sàng');
+        }
+      } catch (e) {
+        console.log('[UDP Parse Error]:', e);
+      }
+    });
+
+    return () => {
+      serverSocket.close();
+    };
+  }, []);
+
+  const handlePressStart = () => {
+    try {
+      const socket = dgram.createSocket({ type: 'udp4' });
+      const message = JSON.stringify({ navigateTo: 2 });
+      const buffer = Buffer.from(message);
+
+      socket.bind(0, (bindError: any) => {
+        if (bindError) return;
+        socket.send(buffer, 0, buffer.length, UDP_PORT, UDP_HOST, () => {
+          console.log(`[UDP Navigate] Đã gửi: ${message}`);
+          socket.close();
+          setCurrentPage(2);
+        });
+      });
+    } catch (e) {
+      console.error('[UDP Navigate Error]:', e);
+      setCurrentPage(2);
+    }
+  };
+
+  const handlePressHome = () => {
+    try {
+      const socket = dgram.createSocket({ type: 'udp4' });
+      const message = JSON.stringify({ navigateTo: 1 });
+      const buffer = Buffer.from(message);
+
+      socket.bind(0, (bindError: any) => {
+        if (bindError) return;
+        socket.send(buffer, 0, buffer.length, UDP_PORT, UDP_HOST, () => {
+          console.log(`[UDP Navigate] Đã gửi: ${message}`);
+          socket.close();
+          setCurrentPage(1);
+        });
+      });
+    } catch (e) {
+      console.error('[UDP Navigate Error]:', e);
+      setCurrentPage(1);
+    }
+  };
 
   useEffect(() => {
     // Cài đặt tần suất cập nhật cảm biến (ví dụ 50ms / lần)
@@ -28,21 +105,27 @@ export default function App() {
     let accelSubscription: any;
     let gyroSubscription: any;
 
-    if (isThrowing) {
-      // Đặt lại giá trị khi bắt đầu ném
-      maxForce.current = 0;
-      setStatusMsg('Đang vung tay...');
+    if (isThrowing || isPositioning) {
+      if (isThrowing) {
+        // Đặt lại giá trị khi bắt đầu ném
+        maxForce.current = 0;
+        setStatusMsg('Đang vung tay...');
+      } else if (isPositioning) {
+        setStatusMsg('Đang chỉnh vị trí ngang...');
+      }
 
-      // Đọc gia tốc kế để tính Lực
+      // Đọc gia tốc kế để tính Lực (lúc ném) và độ trượt Ox (lúc chọn vị trí)
       accelSubscription = Accelerometer.addListener(({ x, y, z }) => {
-        // Tính độ lớn gia tốc tổng hợp
-        const force = Math.sqrt(x * x + y * y + z * z);
-        if (force > maxForce.current) {
-          maxForce.current = force;
+        currentAccel.current = { x, y, z };
+        if (isThrowing) {
+          const force = Math.sqrt(x * x + y * y + z * z);
+          if (force > maxForce.current) {
+            maxForce.current = force;
+          }
         }
       });
 
-      // Đọc con quay hồi chuyển để tính Hướng
+      // Đọc con quay hồi chuyển cho ném bóng
       gyroSubscription = Gyroscope.addListener(({ x, y, z }) => {
         currentAngle.current = { x, y, z };
       });
@@ -54,7 +137,41 @@ export default function App() {
       if (accelSubscription) accelSubscription.remove();
       if (gyroSubscription) gyroSubscription.remove();
     };
-  }, [isThrowing]);
+  }, [isThrowing, isPositioning]);
+
+  const handleStartPosition = () => {
+    setIsPositioning(true);
+    setStatusMsg('Đang chỉnh vị trí ngang...');
+    
+    if (positionInterval.current) clearInterval(positionInterval.current);
+    positionInterval.current = setInterval(() => {
+      try {
+        const socket = dgram.createSocket({ type: 'udp4' });
+        // Đo chuyển động trượt tịnh tiến ngang trên trục Ox của Gia tốc kế
+        const posVal = parseFloat(currentAccel.current.x.toFixed(2));
+        const message = JSON.stringify({ type: 'position', position: posVal});
+        const buffer = Buffer.from(message);
+
+        socket.bind(0, (bindError: any) => {
+          if (bindError) return;
+          socket.send(buffer, 0, buffer.length, UDP_PORT, UDP_HOST, () => {
+            socket.close();
+          });
+        });
+      } catch (e) {
+        console.error('[UDP Position Error]:', e);
+      }
+    }, 17);
+  };
+
+  const handleEndPosition = () => {
+    setIsPositioning(false);
+    if (positionInterval.current) {
+      clearInterval(positionInterval.current);
+      positionInterval.current = null;
+    }
+    setStatusMsg('Đã chốt vị trí! Sẵn sàng ném.');
+  };
 
   const handleStartThrow = () => {
     setIsThrowing(true);
@@ -117,32 +234,72 @@ export default function App() {
 
   return (
     <View style={styles.container}>
-      <Text style={styles.title}>BOWLING CONTROLLER</Text>
-      
-      <View style={styles.statusBox}>
-        <Text style={styles.statusText}>
-          Trạng thái: {statusMsg}
-        </Text>
-        <Text style={styles.resultText}>
-          Lần ném cuối - Lực: {lastThrow.force} | Hướng: {lastThrow.angle}
-        </Text>
-      </View>
+      {currentPage === 1 ? (
+        // Trang chủ (Step 1)
+        <View style={styles.pageContent}>
+          <View style={styles.headerBar}>
+            <Text style={styles.headerTitle}>BOWLING GAME</Text>
+          </View>
+          
 
-      <TouchableOpacity 
-        style={[styles.button, isThrowing && styles.buttonActive]}
-        onPressIn={handleStartThrow}
-        onPressOut={handleEndThrow}
-      >
-        <Text style={styles.buttonText}>
-          {isThrowing ? "THẢ BÓNG" : "GIỮ & VUNG TAY"}
-        </Text>
-      </TouchableOpacity>
+          <TouchableOpacity 
+            style={styles.startButton}
+            onPress={handlePressStart}
+            activeOpacity={0.8}
+          >
+            <Text style={styles.startButtonText}>PLAY</Text>
+          </TouchableOpacity>
+        </View>
+      ) : (
+        // Trang chơi game (Step 2)
+        <View style={styles.pageContent}>
+          <View style={styles.topHeader}>
+            <View style={styles.headerBarMini}>
+              <Text style={styles.headerTitleMini}>BOWLING CONTROLLER</Text>
+            </View>
+            
+            <TouchableOpacity 
+              style={styles.homeImageButton}
+              onPress={handlePressHome}
+              activeOpacity={0.8}
+            >
+              <Image source={require('./assets/home.png')} style={styles.homeIconImage} resizeMode="contain" />
+            </TouchableOpacity>
+          </View>
+          
+          <View style={styles.centerContainer}>
+            <View style={styles.buttonContainer}>
+              <TouchableOpacity 
+                style={[styles.posButton, isPositioning && styles.posButtonActive]}
+                onPressIn={handleStartPosition}
+                onPressOut={handleEndPosition}
+                activeOpacity={0.85}
+              >
+                <Text style={styles.posButtonText}>
+                  {isPositioning ? "ĐANG CHỈNH NGANG..." : "CHỌN VỊ TRÍ"}
+                </Text>
+              </TouchableOpacity>
 
-      <Text style={styles.instructions}>
-        1. Kết nối WiFi điện thoại với mạng của ESP8266 ({UDP_HOST}).{'\n'}
-        2. Nhấn giữ nút, thực hiện động tác ném bowling.{'\n'}
-        3. Buông tay ra khỏi màn hình để thả bóng qua UDP port {UDP_PORT}.
-      </Text>
+              <TouchableOpacity 
+                style={[styles.ballButton, isThrowing && styles.ballButtonActive]}
+                onPressIn={handleStartThrow}
+                onPressOut={handleEndThrow}
+                activeOpacity={0.85}
+              >
+                <Image 
+                  source={require('./assets/bowling.png')} 
+                  style={styles.bowlingImage} 
+                  resizeMode="contain" 
+                />
+              </TouchableOpacity>
+
+              <Text style={styles.posButtonText2}>
+                GIỮ VÀ VUNG TAY ĐỂ NÉM
+              </Text>
+            </View>
+          </View>
+        </View>
+      )}
     </View>
   );
 }
@@ -150,63 +307,166 @@ export default function App() {
 const styles = StyleSheet.create({
   container: {
     flex: 1,
-    backgroundColor: '#1E1E1E',
+    backgroundColor: '#4A3B32', // Nâu ấm chủ đạo
     alignItems: 'center',
     justifyContent: 'center',
-    padding: 20,
-  },
-  title: {
-    fontSize: 28,
-    fontWeight: 'bold',
-    color: '#00E5FF',
-    marginBottom: 40,
-  },
-  statusBox: {
-    marginBottom: 40,
     padding: 15,
-    borderRadius: 10,
-    backgroundColor: '#333',
+  },
+  pageContent: {
+    flex: 1,
     width: '100%',
     alignItems: 'center',
+    justifyContent: 'space-around',
+    paddingVertical: 20,
   },
-  statusText: {
-    color: '#FFF',
-    fontSize: 18,
-    marginBottom: 10,
+  headerBar: {
+    backgroundColor: '#5C3A21',
+    borderWidth: 4,
+    borderColor: '#3B2211',
+    borderRadius: 20,
+    paddingVertical: 15,
+    paddingHorizontal: 30,
+    elevation: 8,
+    shadowColor: '#000',
+    shadowOpacity: 0.5,
+    shadowRadius: 10,
   },
-  resultText: {
-    color: '#00E5FF',
-    fontSize: 16,
+  headerTitle: {
+    fontSize: 28,
+    fontWeight: '900',
+    color: '#FFD500', // Vàng gold
+    letterSpacing: 2,
+    textAlign: 'center',
+  },
+  subTitle: {
+    fontSize: 22,
     fontWeight: 'bold',
+    color: '#FFCC00',
+    letterSpacing: 1,
   },
-  button: {
-    width: 250,
-    height: 250,
-    borderRadius: 125,
-    backgroundColor: '#FF3D00',
+  startButton: {
+    marginTop: -150,
+    width: 240,
+    height: 240,
+    borderRadius: 120,
+    backgroundColor: '#FFCC00', // Vàng rực như ảnh
+    borderWidth: 10,
+    borderColor: '#FF9900', // Viền cam vàng
     alignItems: 'center',
     justifyContent: 'center',
-    elevation: 10,
-    shadowColor: '#FF3D00',
-    shadowOpacity: 0.5,
-    shadowRadius: 20,
+    elevation: 12,
+    shadowColor: '#000',
+    shadowOpacity: 0.6,
+    shadowRadius: 15,
   },
-  buttonActive: {
-    backgroundColor: '#00C853',
-    shadowColor: '#00C853',
+  startButtonText: {
+    color: '#4A2E13', // Chữ nâu đậm
+    fontSize: 38,
+    fontWeight: '900',
+    letterSpacing: 3,
+  },
+  startButtonSub: {
+    color: '#5C3A21',
+    fontSize: 16,
+    fontWeight: 'bold',
+    marginTop: 5,
+  },
+  infoBar: {
+    backgroundColor: 'rgba(92, 58, 33, 0.8)',
+    paddingHorizontal: 20,
+    paddingVertical: 10,
+    borderRadius: 15,
+    borderWidth: 2,
+    borderColor: '#8D6E63',
+  },
+  infoText: {
+    color: '#FFD500',
+    fontSize: 15,
+    fontWeight: '600',
+  },
+  topHeader: {
+    width: '100%',
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    paddingHorizontal: 5,
+  },
+  headerBarMini: {
+    backgroundColor: '#5C3A21',
+    borderWidth: 3,
+    borderColor: '#3B2211',
+    borderRadius: 15,
+    paddingVertical: 10,
+    paddingHorizontal: 15,
+  },
+  headerTitleMini: {
+    fontSize: 18,
+    fontWeight: '900',
+    color: '#FFD500',
+  },
+  homeImageButton: {
+    padding: 5,
+    borderRadius: 25,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  homeIconImage: {
+    width: 50,
+    height: 50,
+  },
+  centerContainer: {
+    flex: 1,
+    width: '100%',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  buttonContainer: {
+    alignItems: 'center',
+    gap: 30,
+  },
+  posButton: {
+    width: 230,
+    height: 58,
+    borderRadius: 29,
+    backgroundColor: '#8D6E63', // Nâu đồng
+    borderWidth: 3,
+    borderColor: '#FFCC00',
+    alignItems: 'center',
+    justifyContent: 'center',
+    elevation: 8,
+    shadowColor: '#000',
+    shadowOpacity: 0.4,
+    shadowRadius: 8,
+  },
+  posButtonActive: {
+    backgroundColor: '#FF9900',
     transform: [{ scale: 0.95 }],
   },
-  buttonText: {
+  posButtonText: {
     color: '#FFF',
-    fontSize: 24,
-    fontWeight: 'bold',
-    textAlign: 'center',
+    fontSize: 18,
+    fontWeight: '900',
+    letterSpacing: 1,
   },
-  instructions: {
-    color: '#AAA',
-    marginTop: 50,
-    fontSize: 14,
-    lineHeight: 24,
-    textAlign: 'center',
-  }
+  posButtonText2: {
+    color: '#FFF',
+    fontSize: 16,
+    fontWeight: '900',
+    letterSpacing: 1,
+    marginTop: -10
+  },
+  ballButton: {
+    width: 230,
+    height: 230,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  ballButtonActive: {
+    transform: [{ scale: 0.94 }],
+  },
+  bowlingImage: {
+    width: 300,
+    height: 300,
+    marginTop: 50
+  },
 });
